@@ -1,12 +1,27 @@
 import os
 import re
 import torch
-from fastapi import FastAPI
+from threading import Thread
+from fastapi import FastAPI, HTTPException, Response, status
 from pydantic import BaseModel
 from pydantic_settings import BaseSettings
 from typing import List, Optional
 from sentence_transformers import SentenceTransformer, util
 from transformers import pipeline
+
+# Everything good and models ready?
+ready = False
+
+
+def load_models():
+    global embedding_model, classification_pipeline, ready
+    embedding_model = load_embedding_model()
+    classification_pipeline = load_classification_pipeline()
+    ready = True
+    print("Models loaded successfully.")
+
+
+Thread(target=load_models).start()
 
 
 class Settings(BaseSettings):
@@ -120,10 +135,6 @@ def load_classification_pipeline():
         raise
 
 
-embedding_model = load_embedding_model()
-classification_pipeline = load_classification_pipeline()
-print("Models loaded successfully.")
-
 app = FastAPI(title="Moderation API Microservice", version="1.1.0")
 
 
@@ -142,11 +153,21 @@ class ModerationResult(BaseModel):
 
 @app.get("/health")
 def health_check():
-    return {"status": "ok", "message": "Moderation API is running."}
+    if not ready:
+        return Response(
+            content='{"status":"loading"}',
+            media_type="application/json",
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        )
+
+    return {"status": "ok"}
 
 
 @app.post("/moderate", response_model=ModerationResult)
 def moderate_message(payload: MessagePayload):
+    if not ready:
+        raise HTTPException(status_code=503, detail="Model not ready")
+
     if banned_regex:
         match = banned_regex.search(payload.message)
         if match:
