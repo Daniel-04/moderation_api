@@ -21,9 +21,6 @@ def load_models():
     print("Models loaded successfully.")
 
 
-Thread(target=load_models).start()
-
-
 class Settings(BaseSettings):
     model_embedding: str = "all-MiniLM-L6-v2"
     model_classification: str = "unitary/toxic-bert"
@@ -224,3 +221,6 @@ def moderate_message(payload: MessagePayload):
 
     # all checks pass
     return ModerationResult(status="pass", similarity_score=similarity_score)
+
+
+Thread(target=load_models).start()
