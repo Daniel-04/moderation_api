@@ -1,24 +1,21 @@
 import os
 import re
+import threading
 import torch
-from threading import Thread
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Response, status
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 from pydantic_settings import BaseSettings
 from typing import List, Optional
 from sentence_transformers import SentenceTransformer, util
 from transformers import pipeline
 
-# Everything good and models ready?
+# Model state
+embedding_model = None
+classification_pipeline = None
 ready = False
-
-
-def load_models():
-    global embedding_model, classification_pipeline, ready
-    embedding_model = load_embedding_model()
-    classification_pipeline = load_classification_pipeline()
-    ready = True
-    print("Models loaded successfully.")
+loading_failed = False
+loading_error = None
 
 
 class Settings(BaseSettings):
@@ -33,8 +30,7 @@ class Settings(BaseSettings):
     # Topic mismatch threshold
     threshold_similarity_flag: float = 0.15
 
-    class Config:
-        env_file = ".env"
+    model_config = ConfigDict(env_file=".env")
 
 
 settings = Settings()
@@ -73,26 +69,41 @@ def build_banned_regex(banned_words: List[str]):
     return re.compile(f"({combined})", re.IGNORECASE)
 
 
-banned_words_list = []
-if settings.banned_words_file and os.path.exists(settings.banned_words_file):
+_banned_regex_cache = None
+
+def get_banned_regex():
+    global _banned_regex_cache
+    if _banned_regex_cache is not None:
+        return _banned_regex_cache
+    if not settings.banned_words_file or not os.path.exists(settings.banned_words_file):
+        return None
     with open(settings.banned_words_file, "r", encoding="utf-8") as f:
-        banned_words_list = [line.strip() for line in f if line.strip()]
+        words = [line.strip() for line in f if line.strip()]
+    regex = build_banned_regex(words)
+    _banned_regex_cache = regex
+    return regex
 
-banned_regex = build_banned_regex(banned_words_list)
 
+_device_cache = None
 
 def get_device():
+    global _device_cache
+    if _device_cache is not None:
+        return _device_cache
     if not torch.cuda.is_available():
-        return "cpu"
+        _device_cache = "cpu"
+        return _device_cache
     try:
-        # tensorflow will literally lie about availability and throw an
-        # exception if the GPU doesnt have the needed compute capabilities.
+        # PyTorch may report CUDA as available but fail at runtime
+        # if the GPU lacks required compute capability.
         t = torch.tensor([1.0], device="cuda:0")
         _ = t * 2
-        return "cuda:0"
+        _device_cache = "cuda:0"
+        return _device_cache
     except Exception as e:
         print(f"Cant use CUDA ({e}), falling back to CPU.")
-        return "cpu"
+        _device_cache = "cpu"
+        return _device_cache
 
 
 def load_embedding_model():
@@ -132,7 +143,33 @@ def load_classification_pipeline():
         raise
 
 
-app = FastAPI(title="Moderation API Microservice", version="1.1.0")
+_model_loading_thread = None
+
+
+def load_models():
+    global embedding_model, classification_pipeline, ready, loading_failed, loading_error
+    try:
+        embedding_model = load_embedding_model()
+        classification_pipeline = load_classification_pipeline()
+        ready = True
+        print("Models loaded successfully.")
+    except Exception as e:
+        loading_failed = True
+        loading_error = str(e)
+        print(f"Failed to load models: {e}")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global _model_loading_thread
+    _model_loading_thread = threading.Thread(target=load_models, daemon=True)
+    _model_loading_thread.start()
+    yield
+    if _model_loading_thread.is_alive():
+        _model_loading_thread.join(timeout=30)
+
+
+app = FastAPI(title="Moderation API Microservice", version="1.1.0", lifespan=lifespan)
 
 
 class MessagePayload(BaseModel):
@@ -150,6 +187,12 @@ class ModerationResult(BaseModel):
 
 @app.get("/health")
 def health_check():
+    if loading_failed:
+        return Response(
+            content=f'{{"status":"failed","error":"{loading_error}"}}',
+            media_type="application/json",
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
     if not ready:
         return Response(
             content='{"status":"loading"}',
@@ -164,7 +207,10 @@ def health_check():
 def moderate_message(payload: MessagePayload):
     if not ready:
         raise HTTPException(status_code=503, detail="Model not ready")
+    if loading_failed:
+        raise HTTPException(status_code=500, detail=f"Model loading failed: {loading_error}")
 
+    banned_regex = get_banned_regex()
     if banned_regex:
         match = banned_regex.search(payload.message)
         if match:
@@ -174,7 +220,10 @@ def moderate_message(payload: MessagePayload):
             )
 
     # Toxicity check
-    classification = classification_pipeline(payload.message)[0]
+    try:
+        classification = classification_pipeline(payload.message)[0]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Classification error: {e}")
     label = classification["label"].lower()
     score = classification["score"]
 
@@ -194,7 +243,6 @@ def moderate_message(payload: MessagePayload):
                 classification_score=score,
             )
         elif score >= settings.threshold_pass:
-            # Between pass threshold and delete threshold
             return ModerationResult(
                 status="inspect",
                 reason="Suspicious or mildy toxic content detected",
@@ -204,10 +252,13 @@ def moderate_message(payload: MessagePayload):
     # Embeddings
     similarity_score = None
     if payload.topic_context:
-        topic_emb = embedding_model.encode(
-            payload.topic_context, convert_to_tensor=True
-        )
-        msg_emb = embedding_model.encode(payload.message, convert_to_tensor=True)
+        try:
+            topic_emb = embedding_model.encode(
+                payload.topic_context, convert_to_tensor=True
+            )
+            msg_emb = embedding_model.encode(payload.message, convert_to_tensor=True)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Embedding error: {e}")
 
         cosine_score = util.cos_sim(topic_emb, msg_emb).item()
         similarity_score = cosine_score
@@ -219,8 +270,9 @@ def moderate_message(payload: MessagePayload):
                 similarity_score=cosine_score,
             )
 
-    # all checks pass
     return ModerationResult(status="pass", similarity_score=similarity_score)
 
 
-Thread(target=load_models).start()
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("main:app", host="0.0.0.0", port=8000)

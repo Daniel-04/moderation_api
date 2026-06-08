@@ -30,16 +30,23 @@ Configuration is handled via environment variables.
 | `THRESHOLD_SIMILARITY_FLAG`| `0.15` | Cosine similarity below which a message is considered off-topic. |
 
 ## Usage
-Start the development server using Uvicorn:
+
+Start the server:
 
 ```bash
-uvicorn main:app --reload
+# Option 1: via uvicorn directly
+uvicorn main:app --host 0.0.0.0 --port 8080
+
+# Option 2: via the module entry point
+python main.py
 ```
+
 By default, the API runs on `http://127.0.0.1:8000`.
 
-```bash
-uvicorn main:app --host 0.0.0.0 --port 8080
-```
+> Models load in a background thread during startup. The health endpoint reports:
+> - **503** models still loading
+> - **500** model loading failed
+> - **200** ready to accept requests
 
 ### Example Requests
 Send a POST request to `/moderate` with the JSON payload.
